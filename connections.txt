@@ -1,0 +1,35 @@
+HC-SR04 Connections:
+
+VCC → ESP32 3.3V(via breadboard)
+GND → ESP32 GND (via breadboard)
+Trigger → ESP32 D5 (via breadboard)
+Echo → ESP32 D2 (via breadboard)
+
+HC-SR04 Connections:
+
+VCC → ESP32 3.3V(via breadboard)
+GND → ESP32 GND (via breadboard)
+Trigger → ESP32 D19 (via breadboard)
+Echo → ESP32 D18 (via breadboard)
+
+
+ESP32 to Arduino UART:
+
+ESP32 TX0 → Arduino RX (Pin 0)
+ESP32 RX0-->Aurduino TX
+We hav to give seperate power to autrduino and ESP32 and don't have to connct their VCC and ground pins
+
+
+Servo Connections
+servo black-->Ground
+servo red--> 5V
+servo yellow--> Pin 9
+
+AVR Commands
+C:\Users\DELL\Documents\Atmel Studio\7.0\servo_config\servo_config\Debug\servo_config.hex
+
+C:\avrdude\bin\avrdude.exe
+
+"C:\avrdude\bin\avrdude.exe" -C"C:\avrdude\etc\avrdude.conf" -v -patmega328p -carduino -P COM7 -b115200 -D -Uflash:w:"C:\Users\DELL\Documents\Atmel Studio\7.0\servo_config\servo_config\Debug\servo_config.hex":i
+
+
