@@ -1,332 +1,288 @@
-.include "m328pdef.inc"
+#include <WiFi.h>
+#include <PubSubClient.h>
 
-; Constants for UART configuration
-.equ BAUD_RATE = 9600
-.equ F_CPU = 16000000
-.equ UBRR_VALUE = F_CPU/16/BAUD_RATE - 1
+// WiFi Credentials
+const char* WIFI_SSID = "TECNOSPARK4";
+const char* WIFI_PASSWORD = "Amir0017";
 
-; Buffer size for UART reception
-.equ BUFFER_SIZE = 32
+// MQTT Broker Details
+const char* MQTT_BROKER = "broker.hivemq.com";
+const int MQTT_PORT = 1883;
+const char* CLIENT_ID = "smartbin_017";
+const char* TOPIC_FILL_LEVEL = "smartdustbin/filllevel";
+const char* TOPIC_LID_STATE = "smartdustbin/lidstate";
 
-; Servo positions (PWM values for Timer1)
-.equ SERVO_CLOSED = 2000  ; 1ms pulse - 0 degrees
-.equ SERVO_OPEN = 4000    ; 2ms pulse - 180 degrees
+// Ultrasonic Sensor Pins for Fill Level
+const int FILL_TRIG_PIN = 19;
+const int FILL_ECHO_PIN = 23;
 
-; Macro to add delay (blocking) up to 2500ms
-.macro delay
-    push r18
-    push r24
-    push r25
-    ldi r18,@0/10
-    L1:
-    ldi r24,LOW(39998)    ; initialize inner loop count
-    ldi r25,HIGH(39998)   ; loop high and low registers
-    L2:
-    sbiw r24,1           ; decrement inner loop registers
-    brne L2              ; branch to L2 if registers != 0
-    dec r18              ; decrement outer loop register
-    brne L1              ; branch to L1 if outer loop register != 0
-    nop                  ; no operation
-    pop r25
-    pop r24
-    pop r18
-.endmacro
+// Ultrasonic Sensor Pins for Proximity Detection (Lid Control)
+const int PROX_TRIG_PIN = 5;
+const int PROX_ECHO_PIN = 2;
 
-; Macros to Read/Write 16-bit registers
-.macro STSw
-    cli
-    STS @0, @1
-    STS @0-1, @2
-    sei
-.endmacro
+// Status LED Pin
+const int LED_PIN = 22;
 
-.macro LDSw
-    cli
-    LDS @1, @2-1
-    LDS @0, @2
-    sei
-.endmacro
+// Bin Dimensions (cm)
+const float BIN_HEIGHT = 18.0;
+const float DEFAULT_FILL_LEVEL = 00.0;
+const float LID_PROXIMITY_THRESHOLD = 10.0; // cm
 
-; Data section for buffer
-.dseg
-UART_BUFFER: .byte BUFFER_SIZE   ; Reserve buffer space for UART reception
-buffer_index: .byte 1           ; Buffer index tracker
-cmd_ready: .byte 1              ; Flag to indicate command ready
+// Timing constants
+const long fillPublishInterval = 10000;      // Publish fill level every 10 seconds
+const long proximityCheckInterval = 1000;     // Check proximity every 200ms (reduced from 300ms)
 
-; Code section
-.cseg
-.org 0x0000
-    jmp RESET                   ; Reset vector
-    
-.org 0x0024                     ; USART RX Complete interrupt vector
-    jmp USART_RX_complete       ; Jump to UART RX interrupt handler
+// Serial communication with Arduino for lid control
+const int ARDUINO_BAUD_RATE = 9600;
 
-; Main program starts here
-.org 0x0030
-RESET:
-    ; Initialize the stack pointer
-    ldi r16, HIGH(RAMEND)
-    out SPH, r16
-    ldi r16, LOW(RAMEND)
-    out SPL, r16
-    
-    ; Initialize UART buffer index
-    ldi r16, 0
-    sts buffer_index, r16
-    
-    ; Clear command ready flag
-    ldi r16, 0
-    sts cmd_ready, r16
-    
-    ; Set pin PB1 (OC1A) as output for servo control
-    ; PB1 is digital pin 9 on Arduino UNO
-    sbi DDRB, 1
-    
-    ; Initialize status LED on PB5 (Arduino pin 13)
-    sbi DDRB, 5
-    
-    ; Flash status LED to indicate startup
-    sbi PORTB, 5      ; LED on
-    delay 100         ; Delay 100ms
-    cbi PORTB, 5      ; LED off
-    delay 100         ; Delay 100ms
-    sbi PORTB, 5      ; LED on
-    delay 100         ; Delay 100ms
-    cbi PORTB, 5      ; LED off
-    
-    ; Initialize UART communication
-    rcall UART_init
-    
-    ; Initialize Timer1 for PWM generation
-    rcall Timer1_init
-    
-    ; Set servo to closed position initially
-    ldi r16, LOW(SERVO_CLOSED)
-    ldi r17, HIGH(SERVO_CLOSED)
-    STSw OCR1AH, r17, r16
-    
-    ; Enable global interrupts
-    sei
-    
-    ; Send startup message via UART
-    ldi ZL, LOW(2*startup_msg)
-    ldi ZH, HIGH(2*startup_msg)
-    rcall UART_send_string
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
 
-; Main program loop
-main_loop:
-    ; Check if a command is ready
-    lds r16, cmd_ready
-    cpi r16, 1
-    brne main_loop
-    
-    ; Process the command
-    rcall process_command
-    
-    ; Clear command ready flag
-    ldi r16, 0
-    sts cmd_ready, r16
-    
-    rjmp main_loop
+unsigned long lastFillPublishTime = 0;
+unsigned long lastProximityCheckTime = 0;
 
-; Initialize Timer1 for servo control
-Timer1_init:
-    ; Set Fast PWM mode with ICR1 as TOP
-    ; COM1A1: Clear OC1A on compare match, set at BOTTOM
-    ; WGM11: Fast PWM mode bit 1
-    ldi r16, (1<<COM1A1) | (1<<WGM11)
-    sts TCCR1A, r16
-    
-    ; Set WGM12, WGM13 and CS11 (Prescaler = 8)
-    ; This gives Mode 14 (Fast PWM with ICR1 as TOP)
-    ldi r16, (1<<WGM13) | (1<<WGM12) | (1<<CS11)
-    sts TCCR1B, r16
-    
-    ; Clear counter
-    ldi r16, 0
-    ldi r17, 0
-    STSw TCNT1H, r17, r16
-    
-    ; Set TOP value for 50Hz (20ms) period
-    ; 16MHz / 8 prescaler = 2MHz timer frequency
-    ; 2MHz / 50Hz = 40,000 counts for 20ms
-    ldi r16, LOW(40000)
-    ldi r17, HIGH(40000)
-    STSw ICR1H, r17, r16
-    
-    ret
+bool firstReadingSent = false;
+bool isLidOpen = false;  // Track current lid state
 
-; Initialize UART at 9600 baud
-UART_init:
-    ; Set baud rate
-    ldi r16, HIGH(UBRR_VALUE)
-    sts UBRR0H, r16
-    ldi r16, LOW(UBRR_VALUE)
-    sts UBRR0L, r16
-    
-    ; Enable receiver and transmitter, enable RX interrupt
-    ldi r16, (1<<RXEN0) | (1<<TXEN0) | (1<<RXCIE0)
-    sts UCSR0B, r16
-    
-    ; Set frame format: 8 data bits, 1 stop bit, no parity
-    ldi r16, (3<<UCSZ00)
-    sts UCSR0C, r16
-    
-    ret
+// Forward declarations
+bool publishFillLevel(float fillPercentage, bool retained);
+bool publishLidState(bool isOpen, bool retained);
+float measureDistance(int trigPin, int echoPin);
 
-; UART RX Complete Interrupt Handler
-USART_RX_complete:
-    push r16
-    push r17
-    push r30
-    push r31
-    
-    ; Read received data
-    lds r16, UDR0
-    
-    ; Check for end of command (newline character)
-    cpi r16, 0x0A      ; Check if character is newline
-    breq end_of_command
-    
-    ; Store the character in buffer
-    lds r17, buffer_index
-    
-    ; Check buffer overflow
-    cpi r17, BUFFER_SIZE
-    brlo continue_rx   ; Branch if less than
-    rjmp rx_exit       ; Long-range jump
-continue_rx:
-    
-    ; Calculate buffer address
-    ldi r30, LOW(UART_BUFFER)
-    ldi r31, HIGH(UART_BUFFER)
-    add r30, r17       ; Add index to buffer base address
-    brcc no_carry
-    inc r31
-no_carry:
-    st Z, r16          ; Store character in buffer
-    
-    ; Increment buffer index
-    inc r17
-    sts buffer_index, r17
-    
-    rjmp rx_exit
-    
-end_of_command:
-    ; Set command ready flag
-    ldi r16, 1
-    sts cmd_ready, r16
-    
-rx_exit:
-    pop r31
-    pop r30
-    pop r17
-    pop r16
-    reti
+void setup() {
+  Serial.begin(ARDUINO_BAUD_RATE);  // UART communication with Arduino UNO
+  Serial.println("\n=== Smart Dustbin System ===");
 
-; Process received command
-process_command:
-    ; Get first character from buffer
-    ldi r30, LOW(UART_BUFFER)
-    ldi r31, HIGH(UART_BUFFER)
-    ld r16, Z          ; Load first character
+  // Configure sensor pins
+  pinMode(FILL_TRIG_PIN, OUTPUT);
+  pinMode(FILL_ECHO_PIN, INPUT);
+  pinMode(PROX_TRIG_PIN, OUTPUT);
+  pinMode(PROX_ECHO_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT);
 
-    ; Check command type by first character
-    cpi r16, 'O'       ; Check if first letter is 'O'
-    breq check_open_cmd ; Branch directly if 'O'
-    cpi r16, 'D'       ; Check if first letter is 'D'
-    breq check_distance_cmd ; Branch directly if 'D'
-    rjmp finish_command ; Unknown command, reset buffer
+  setupWiFi();
+  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+  mqttClient.setKeepAlive(60);  // Longer keep-alive for stability
+  
+  // Initial delay to allow Arduino to boot
+  delay(2000);
+}
 
-check_open_cmd:
-    ; Check if command is O:x
-    ld r16, Z+         ; Skip 'O' (already checked)
-    ld r16, Z+         ; Load second character
-    cpi r16, ':'
-    breq continue_open_cmd ; Branch if equal
-    rjmp finish_command    ; Long-range jump
-continue_open_cmd:
-    ld r16, Z+         ; Load third character
-    cpi r16, '1'       ; Check if it's open command (O:1)
-    breq do_open_servo
-    cpi r16, '0'       ; Check if it's close command (O:0)
-    breq do_close_servo
-    rjmp finish_command
+void loop() {
+  if (!mqttClient.connected()) {
+    reconnectMQTT();
+  }
+  mqttClient.loop();
 
-check_distance_cmd:
-    ; Check if command starts with 'D:'
-    ld r16, Z+         ; Skip 'D' (already checked)
-    ld r16, Z+         ; Load second character
-    cpi r16, ':'
-    breq continue_distance_cmd ; Branch if equal
-    rjmp finish_command       ; Long-range jump
-continue_distance_cmd:
-    ; Process distance value if needed
-    rjmp finish_command
+  // Get current time once to use for both checks
+  unsigned long currentMillis = millis();
+  
+  // Proximity detection for lid control (more frequent checks)
+  // Check proximity first for better responsiveness
+  if (currentMillis - lastProximityCheckTime >= proximityCheckInterval) {
+    lastProximityCheckTime = currentMillis;
+    checkProximityAndControlLid();
+  }
+  
+  // Fill level publishing at regular intervals
+  if (currentMillis - lastFillPublishTime >= fillPublishInterval) {
+    lastFillPublishTime = currentMillis;
+    measureAndPublishFillLevel();
+  }
+}
 
-do_open_servo:
-    ; Send acknowledgment
-    ldi ZL, LOW(2*open_msg)
-    ldi ZH, HIGH(2*open_msg)
-    rcall UART_send_string
-    ; Turn on status LED
-    sbi PORTB, 5
-    ; Set servo to open position
-    ldi r16, LOW(SERVO_OPEN)
-    ldi r17, HIGH(SERVO_OPEN)
-    STSw OCR1AH, r17, r16
-    delay 1000         ; Wait for servo to move
-    rjmp finish_command
+void setupWiFi() {
+  delay(10);
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-do_close_servo:
-    ; Send acknowledgment
-    ldi ZL, LOW(2*close_msg)
-    ldi ZH, HIGH(2*close_msg)
-    rcall UART_send_string
-    ; Set servo to closed position
-    ldi r16, LOW(SERVO_CLOSED)
-    ldi r17, HIGH(SERVO_CLOSED)
-    STSw OCR1AH, r17, r16
-    delay 1000         ; Wait for servo to move
-    ; Turn off status LED
-    cbi PORTB, 5
-    rjmp finish_command
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ WiFi connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+}
 
-finish_command:
-    ; Reset buffer index
-    ldi r16, 0
-    sts buffer_index, r16
-    ret
-
-; Send a null-terminated string via UART
-UART_send_string:
-    ; Z register should be preloaded with the address of the string
-    push r16
+void reconnectMQTT() {
+  int retry = 0;
+  while (!mqttClient.connected() && retry < 3) {
+    Serial.print("Attempting MQTT connection...");
     
-send_loop:
-    lpm r16, Z+        ; Load byte from program memory
-    cpi r16, 0         ; Check for null terminator
-    breq send_done     ; Exit if null
+    // Create a random client ID to prevent conflicts
+    String clientId = CLIENT_ID;
+    clientId += String(random(0xffff), HEX);
     
-    rcall UART_send_char
-    rjmp send_loop
-    
-send_done:
-    pop r16
-    ret
+    if (mqttClient.connect(clientId.c_str())) {
+      Serial.println("✅ Connected to MQTT Broker");
+      
+      // Send default readings with retained flag on first connect
+      if (!firstReadingSent) {
+        publishFillLevel(DEFAULT_FILL_LEVEL, true);
+        publishLidState(isLidOpen, true);
+        firstReadingSent = true;
+        Serial.println("✅ Default values published with retained flag");
+      }
+    } else {
+      Serial.print("❌ MQTT failed, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" - retrying...");
+      retry++;
+      delay(2000);
+    }
+  }
+}
 
-; Send single character via UART
-UART_send_char:
-    ; Wait for transmit buffer to be empty
-    lds r17, UCSR0A
-    sbrs r17, UDRE0
-    rjmp UART_send_char
-    
-    ; Send character
-    sts UDR0, r16
-    ret
+float measureDistance(int trigPin, int echoPin) {
+  // Clear the trigger pin
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  
+  // Send 10μs pulse to trigger
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
 
-; String constants in program memory
-startup_msg: .db "AVR Servo Controller Ready", 13, 10, 0
-open_msg:    .db "Opening lid", 13, 10, 0
-close_msg:   .db "Closing lid", 13, 10, 0
+  // Measure the duration of the echo pulse with shorter timeout
+  // Reduced from 30000 to 15000 for faster readings
+  long duration = pulseIn(echoPin, HIGH, 15000);
+  
+  // Calculate distance (speed of sound = 0.034 cm/μs)
+  float distance = duration * 0.034 / 2;
+
+  if (duration == 0) {
+    // Only log timeout for the fill level sensor to reduce serial noise
+    if (trigPin == FILL_TRIG_PIN) {
+      Serial.println("⚠️ Warning: Echo timeout - sensor may be disconnected or out of range");
+    }
+    return -1;
+  }
+  
+  if (distance < 0.5 || distance > 400) {
+    // Only log for fill level sensor
+    if (trigPin == FILL_TRIG_PIN) {
+      Serial.println("⚠️ Warning: Distance calculation out of valid range");
+    }
+    return -1;
+  }
+
+  return distance;
+}
+
+bool publishFillLevel(float fillPercentage, bool retained) {
+  // Format with one decimal place - worked with gauge widget
+  char msg[10];
+  snprintf(msg, sizeof(msg), "%.1f", fillPercentage);
+  
+  // Use QoS 0 to match panel settings, with optional retained flag
+  bool success = mqttClient.publish(TOPIC_FILL_LEVEL, msg, retained);
+
+  Serial.print("📤 Fill Level: ");
+  Serial.print(msg);
+  Serial.print("% - MQTT Status: ");
+  Serial.println(success ? "Published ✓" : "Failed ✗");
+
+  return success;
+}
+
+bool publishLidState(bool isOpen, bool retained) {
+  const char* msg = isOpen ? "OPEN" : "CLOSED";
+  
+  // Use QoS 0 with optional retained flag
+  bool success = mqttClient.publish(TOPIC_LID_STATE, msg, retained);
+
+  Serial.print("📤 Lid State: ");
+  Serial.print(msg);
+  Serial.print(" - MQTT Status: ");
+  Serial.println(success ? "Published ✓" : "Failed ✗");
+
+  return success;
+}
+
+void measureAndPublishFillLevel() {
+  float currentHeight = measureDistance(FILL_TRIG_PIN, FILL_ECHO_PIN);
+  
+  // Always display distance measurement regardless of validity
+  Serial.print("📏 Current height: ");
+  Serial.print(currentHeight);
+  Serial.println(" cm");
+  
+  if (currentHeight <= 0 || currentHeight > BIN_HEIGHT) {
+    Serial.println("⚠️ Invalid fill level measurement, using default value");
+    publishFillLevel(DEFAULT_FILL_LEVEL, false);
+    return;
+  }
+
+  float fillPercentage = ((BIN_HEIGHT - currentHeight) / BIN_HEIGHT) * 100;
+  
+  // Ensure values stay within valid range
+  if (fillPercentage < 0) fillPercentage = 0;
+  if (fillPercentage > 100) fillPercentage = 100;
+  
+  // Display calculation details
+  Serial.print("🧮 Calculation: ((");
+  Serial.print(BIN_HEIGHT);
+  Serial.print(" - ");
+  Serial.print(currentHeight);
+  Serial.print(") / ");
+  Serial.print(BIN_HEIGHT);
+  Serial.print(") * 100 = ");
+  Serial.print(fillPercentage);
+  Serial.println("%");
+  
+  publishFillLevel(fillPercentage, false);
+}
+
+void checkProximityAndControlLid() {
+  // Take average of 3 measurements for stability
+  float distances[3];
+  float avgDistance = 0;
+  
+  for (int i = 0; i < 3; i++) {
+    distances[i] = measureDistance(PROX_TRIG_PIN, PROX_ECHO_PIN);
+    if (distances[i] > 0) { // Only include valid readings
+      avgDistance += distances[i];
+    } else {
+      // If invalid reading, try again
+      i--;
+      delay(10);
+      continue;
+    }
+    delay(10);
+  }
+  
+  avgDistance /= 3;
+  
+  // Send distance data to Arduino UNO via UART
+  Serial.print("D:");
+  Serial.println(avgDistance);
+  
+  // Only send open/close commands when state changes
+  if (avgDistance < LID_PROXIMITY_THRESHOLD && !isLidOpen) {
+    // If hand is detected and lid is closed, send open command
+    Serial.println("O:1");  // Open command
+    digitalWrite(LED_PIN, HIGH);  // Turn on status LED
+    isLidOpen = true;
+    publishLidState(isLidOpen, false);  // Publish state change to MQTT
+    delay(100);  // Small delay to avoid command flooding
+  } 
+  else if (avgDistance < LID_PROXIMITY_THRESHOLD && isLidOpen) {
+    // If hand is detected and lid is closed, send open command
+    Serial.println("O:0");  // Open command
+    digitalWrite(LED_PIN, LOW);  // Turn on status LED
+    isLidOpen = false;
+    publishLidState(isLidOpen, false);  // Publish state change to MQTT
+    delay(100);  // Small delay to avoid command flooding
+  } 
+
+  else if (avgDistance >= LID_PROXIMITY_THRESHOLD && isLidOpen) {
+    // If no hand detected and lid is open, send close command
+    Serial.println("O:0");  // Close command
+    digitalWrite(LED_PIN, LOW);  // Turn off status LED
+    isLidOpen = false;
+    publishLidState(isLidOpen, false);  // Publish state change to MQTT
+    delay(100);  // Small delay to avoid command flooding
+  }
+}
