@@ -24,13 +24,13 @@ const int PROX_ECHO_PIN = 2;
 const int LED_PIN = 22;
 
 // Bin Dimensions (cm)
-const float BIN_HEIGHT = 42.0;
-const float DEFAULT_FILL_LEVEL = 20.0;
-const float LID_PROXIMITY_THRESHOLD = 50.0; // cm
+const float BIN_HEIGHT = 18.0;
+const float DEFAULT_FILL_LEVEL = 00.0;
+const float LID_PROXIMITY_THRESHOLD = 10.0; // cm
 
 // Timing constants
 const long fillPublishInterval = 10000;      // Publish fill level every 10 seconds
-const long proximityCheckInterval = 200;     // Check proximity every 200ms (reduced from 300ms)
+const long proximityCheckInterval = 1000;     // Check proximity every 200ms (reduced from 300ms)
 
 // Serial communication with Arduino for lid control
 const int ARDUINO_BAUD_RATE = 9600;
@@ -268,6 +268,15 @@ void checkProximityAndControlLid() {
     publishLidState(isLidOpen, false);  // Publish state change to MQTT
     delay(100);  // Small delay to avoid command flooding
   } 
+  else if (avgDistance < LID_PROXIMITY_THRESHOLD && isLidOpen) {
+    // If hand is detected and lid is closed, send open command
+    Serial.println("O:0");  // Open command
+    digitalWrite(LED_PIN, LOW);  // Turn on status LED
+    isLidOpen = false;
+    publishLidState(isLidOpen, false);  // Publish state change to MQTT
+    delay(100);  // Small delay to avoid command flooding
+  } 
+
   else if (avgDistance >= LID_PROXIMITY_THRESHOLD && isLidOpen) {
     // If no hand detected and lid is open, send close command
     Serial.println("O:0");  // Close command
